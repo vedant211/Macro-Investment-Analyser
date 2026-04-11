@@ -78,6 +78,41 @@ st.markdown("""
         font-size: 0.95rem;
     }
 
+    /* ── Sidebar radio navigation — menu-style items ── */
+    section[data-testid="stSidebar"] .stRadio > div {
+        gap: 0.35rem !important;
+        display: flex;
+        flex-direction: column;
+    }
+    section[data-testid="stSidebar"] .stRadio > div > label {
+        background: transparent;
+        border: 1px solid transparent;
+        border-left: 3px solid transparent;
+        border-radius: 4px;
+        padding: 0.6rem 0.8rem !important;
+        margin: 0 !important;
+        transition: all 0.15s ease;
+        cursor: pointer;
+    }
+    section[data-testid="stSidebar"] .stRadio > div > label:hover {
+        background: rgba(74,144,226,0.08);
+        border-left-color: #4a90e2;
+    }
+    section[data-testid="stSidebar"] .stRadio > div > label[data-checked="true"],
+    section[data-testid="stSidebar"] .stRadio > div > label:has(input:checked) {
+        background: rgba(201,169,110,0.1) !important;
+        border-left-color: #c9a96e !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > div > label p {
+        color: var(--text-primary) !important;
+        font-size: 0.88rem !important;
+        font-weight: 500 !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > div > label:has(input:checked) p {
+        color: #FFFFFF !important;
+        font-weight: 600 !important;
+    }
+
     /* ── Main content padding ── */
     .block-container {
         padding-top: 1.5rem;
@@ -2282,6 +2317,35 @@ def page_export():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Master list of pages (single source of truth) ──
+    PAGES = [
+        "Home / Overview",
+        "Country Comparison",
+        "Markets & Investment Analysis",
+        "Valuation & Macro Insights",
+        "Investment Memo Generator",
+        "Risk Dashboard",
+        "Sector / Economic Structure",
+        "Scenario Analysis",
+        "Export / Report Center",
+    ]
+
+    routes = {
+        "Home / Overview": page_home,
+        "Country Comparison": page_country_compare,
+        "Markets & Investment Analysis": page_markets,
+        "Valuation & Macro Insights": page_valuation,
+        "Investment Memo Generator": page_memo,
+        "Risk Dashboard": page_risk,
+        "Sector / Economic Structure": page_sectors,
+        "Scenario Analysis": page_scenario,
+        "Export / Report Center": page_export,
+    }
+
+    # ── Persistent current-page state (survives reruns) ──
+    if "current_page" not in st.session_state:
+        st.session_state.current_page = PAGES[0]
+
     # ── Sidebar branding & navigation ──
     with st.sidebar:
         st.markdown(
@@ -2297,21 +2361,24 @@ def main():
             unsafe_allow_html=True,
         )
 
-        page = st.radio(
-            "Navigation",
-            [
-                "Home / Overview",
-                "Country Comparison",
-                "Markets & Investment",
-                "Valuation & Macro",
-                "Investment Memo",
-                "Risk Dashboard",
-                "Sector Analysis",
-                "Scenario Analysis",
-                "Export / Reports",
-            ],
-            label_visibility="collapsed",
+        st.markdown(
+            '<div style="color:#c9a96e;font-size:0.7rem;font-weight:700;'
+            'letter-spacing:2px;text-transform:uppercase;margin-bottom:0.6rem">'
+            'Navigation</div>',
+            unsafe_allow_html=True,
         )
+
+        sidebar_choice = st.radio(
+            "Navigation Menu",
+            PAGES,
+            index=PAGES.index(st.session_state.current_page),
+            label_visibility="collapsed",
+            key="sidebar_nav",
+        )
+        # Sync sidebar -> session state
+        if sidebar_choice != st.session_state.current_page:
+            st.session_state.current_page = sidebar_choice
+            st.rerun()
 
         st.markdown(
             '<div style="padding:1.2rem 0 0 0;margin-top:2rem;border-top:1px solid #1f2a44">'
@@ -2322,23 +2389,25 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ── Route to selected page ──
-    routes = {
-        "Home / Overview": page_home,
-        "Country Comparison": page_country_compare,
-        "Markets & Investment": page_markets,
-        "Valuation & Macro": page_valuation,
-        "Investment Memo": page_memo,
-        "Risk Dashboard": page_risk,
-        "Sector Analysis": page_sectors,
-        "Scenario Analysis": page_scenario,
-        "Export / Reports": page_export,
-    }
+    # ── Top-bar navigation (always visible on main content as a failsafe) ──
+    top_col1, top_col2 = st.columns([1, 3])
+    with top_col1:
+        topbar_choice = st.selectbox(
+            "Section",
+            PAGES,
+            index=PAGES.index(st.session_state.current_page),
+            key="topbar_nav",
+            label_visibility="collapsed",
+        )
+        if topbar_choice != st.session_state.current_page:
+            st.session_state.current_page = topbar_choice
+            st.rerun()
 
+    # ── Route to selected page ──
     try:
-        routes[page]()
+        routes[st.session_state.current_page]()
     except Exception as e:
-        st.error(f"An error occurred while loading this page. Please refresh and try again.")
+        st.error("An error occurred while loading this page. Please refresh and try again.")
         st.caption(f"Detail: {type(e).__name__}")
 
 
