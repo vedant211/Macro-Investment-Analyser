@@ -2317,7 +2317,7 @@ def page_export():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # ── Master list of pages (single source of truth) ──
+    # ── Master list of pages ──
     PAGES = [
         "Home / Overview",
         "Country Comparison",
@@ -2330,23 +2330,7 @@ def main():
         "Export / Report Center",
     ]
 
-    routes = {
-        "Home / Overview": page_home,
-        "Country Comparison": page_country_compare,
-        "Markets & Investment Analysis": page_markets,
-        "Valuation & Macro Insights": page_valuation,
-        "Investment Memo Generator": page_memo,
-        "Risk Dashboard": page_risk,
-        "Sector / Economic Structure": page_sectors,
-        "Scenario Analysis": page_scenario,
-        "Export / Report Center": page_export,
-    }
-
-    # ── Persistent current-page state (survives reruns) ──
-    if "current_page" not in st.session_state:
-        st.session_state.current_page = PAGES[0]
-
-    # ── Sidebar branding & navigation ──
+    # ── Sidebar branding ──
     with st.sidebar:
         st.markdown(
             '<div style="padding:1rem 0 1.5rem 0;border-bottom:1px solid #1f2a44;'
@@ -2368,17 +2352,14 @@ def main():
             unsafe_allow_html=True,
         )
 
-        sidebar_choice = st.radio(
+        # ── Single navigation widget — drives the entire app ──
+        selected_page = st.sidebar.radio(
             "Navigation Menu",
             PAGES,
-            index=PAGES.index(st.session_state.current_page),
+            index=0,
             label_visibility="collapsed",
-            key="sidebar_nav",
+            key="navigation",
         )
-        # Sync sidebar -> session state
-        if sidebar_choice != st.session_state.current_page:
-            st.session_state.current_page = sidebar_choice
-            st.rerun()
 
         st.markdown(
             '<div style="padding:1.2rem 0 0 0;margin-top:2rem;border-top:1px solid #1f2a44">'
@@ -2389,26 +2370,29 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ── Top-bar navigation (always visible on main content as a failsafe) ──
-    top_col1, top_col2 = st.columns([1, 3])
-    with top_col1:
-        topbar_choice = st.selectbox(
-            "Section",
-            PAGES,
-            index=PAGES.index(st.session_state.current_page),
-            key="topbar_nav",
-            label_visibility="collapsed",
-        )
-        if topbar_choice != st.session_state.current_page:
-            st.session_state.current_page = topbar_choice
-            st.rerun()
-
-    # ── Route to selected page ──
-    try:
-        routes[st.session_state.current_page]()
-    except Exception as e:
-        st.error("An error occurred while loading this page. Please refresh and try again.")
-        st.caption(f"Detail: {type(e).__name__}")
+    # ══════════════════════════════════════════════════════
+    #  PAGE ROUTING — explicit if/elif so each page renders
+    # ══════════════════════════════════════════════════════
+    if selected_page == "Home / Overview":
+        page_home()
+    elif selected_page == "Country Comparison":
+        page_country_compare()
+    elif selected_page == "Markets & Investment Analysis":
+        page_markets()
+    elif selected_page == "Valuation & Macro Insights":
+        page_valuation()
+    elif selected_page == "Investment Memo Generator":
+        page_memo()
+    elif selected_page == "Risk Dashboard":
+        page_risk()
+    elif selected_page == "Sector / Economic Structure":
+        page_sectors()
+    elif selected_page == "Scenario Analysis":
+        page_scenario()
+    elif selected_page == "Export / Report Center":
+        page_export()
+    else:
+        page_home()
 
 
 if __name__ == "__main__":
