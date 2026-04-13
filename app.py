@@ -432,59 +432,9 @@ st.markdown("""
         line-height: 1.6;
     }
 
-    /* ── Hide default Streamlit chrome ── */
+    /* ── Hide only the menu and footer (keep header so sidebar toggle works on Cloud) ── */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
-
-    /* ── Keep sidebar toggle visible when sidebar is collapsed ── */
-    [data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapsedControl"] {
-        visibility: visible !important;
-        display: flex !important;
-        background: #131c2e !important;
-        border: 1px solid #1f2a44 !important;
-        border-left: 3px solid #c9a96e !important;
-        border-radius: 4px !important;
-        padding: 8px 12px !important;
-        top: 14px !important;
-        left: 14px !important;
-        z-index: 999999 !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
-        transition: all 0.2s ease;
-    }
-    [data-testid="collapsedControl"]:hover,
-    [data-testid="stSidebarCollapsedControl"]:hover {
-        border-color: #c9a96e !important;
-        background: #1a2438 !important;
-    }
-    [data-testid="collapsedControl"] svg,
-    [data-testid="stSidebarCollapsedControl"] svg,
-    [data-testid="collapsedControl"] button svg,
-    [data-testid="stSidebarCollapsedControl"] button svg {
-        color: #c9a96e !important;
-        fill: #c9a96e !important;
-        width: 20px !important;
-        height: 20px !important;
-    }
-    [data-testid="collapsedControl"] button,
-    [data-testid="stSidebarCollapsedControl"] button {
-        background: transparent !important;
-        border: none !important;
-        color: #c9a96e !important;
-        font-weight: 600;
-    }
-    /* Add "MENU" label next to the icon */
-    [data-testid="collapsedControl"]::after,
-    [data-testid="stSidebarCollapsedControl"]::after {
-        content: "MENU";
-        color: #c9a96e;
-        font-size: 0.72rem;
-        font-weight: 700;
-        letter-spacing: 1.5px;
-        margin-left: 6px;
-        align-self: center;
-    }
 </style>
 """, unsafe_allow_html=True)
 
