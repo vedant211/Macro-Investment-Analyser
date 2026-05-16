@@ -17,6 +17,8 @@ import requests
 import datetime
 import io
 import math
+import pandas as pd
+import numpy as np
 
 # Optional dependency — gracefully degrade if missing
 try:
@@ -2263,6 +2265,645 @@ def page_export():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: U.S. TOP STOCKS  (Dow Jones 30 — daily-refreshed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+DOW30 = ["AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","GS","HD",
+         "HON","IBM","JNJ","JPM","KO","MCD","MMM","MRK","MSFT","NKE","NVDA",
+         "PG","SHW","TRV","UNH","V","VZ","WMT","AMZN"]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_dow30_data():
+    """Fetch daily-refreshed Dow 30 stock data. Returns a list of dicts."""
+    if not HAS_YFINANCE:
+        return []
+    out = []
+    for tk in DOW30:
+        try:
+            t = yf.Ticker(tk)
+            info = {}
+            try:
+                info = t.info or {}
+            except Exception:
+                info = {}
+            hist = t.history(period="1y")
+            if hist is None or hist.empty:
+                continue
+            closes = hist["Close"].tolist()
+            volumes = hist["Volume"].tolist()
+            cur = float(closes[-1])
+            prev = float(closes[-2]) if len(closes) > 1 else cur
+            daily_pct = (cur / prev - 1) * 100 if prev else 0.0
+
+            def ret_n(n):
+                if len(closes) <= n: return None
+                base = closes[-(n+1)]
+                return (cur / base - 1) * 100 if base else None
+
+            # YTD return
+            ytd_ret = None
+            try:
+                yr = datetime.date.today().year
+                ytd_rows = hist[hist.index.year == yr]
+                if not ytd_rows.empty:
+                    base = float(ytd_rows["Close"].iloc[0])
+                    if base: ytd_ret = (cur / base - 1) * 100
+            except Exception:
+                ytd_ret = None
+
+            hi52 = float(max(closes))
+            lo52 = float(min(closes))
+            dist_hi = (cur / hi52 - 1) * 100 if hi52 else None
+            avg_vol = float(np.mean(volumes)) if volumes else None
+
+            row = {
+                "Ticker": tk,
+                "Name": info.get("shortName", tk),
+                "Price": cur,
+                "Daily %": daily_pct,
+                "5D %": ret_n(5),
+                "1M %": ret_n(21),
+                "3M %": ret_n(63),
+                "YTD %": ytd_ret,
+                "52W High": hi52,
+                "52W Low": lo52,
+                "From High %": dist_hi,
+                "Volume": float(volumes[-1]) if volumes else None,
+                "Avg Vol": avg_vol,
+                "Market Cap": info.get("marketCap"),
+                "P/E": info.get("trailingPE"),
+                "Fwd P/E": info.get("forwardPE"),
+                "Div Yield %": (info.get("dividendYield") or 0) * 100 if info.get("dividendYield") else None,
+                "Beta": info.get("beta"),
+                "Rec": info.get("recommendationKey", "—"),
+            }
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _safe(v, default=None):
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return default
+    return v
+
+
+def score_stock(r):
+    """Composite ranking score (higher = better)."""
+    s = 50.0
+    m1 = _safe(r.get("1M %"))
+    m3 = _safe(r.get("3M %"))
+    ytd = _safe(r.get("YTD %"))
+    dist = _safe(r.get("From High %"))
+    pe = _safe(r.get("P/E"))
+    dy = _safe(r.get("Div Yield %"))
+    beta = _safe(r.get("Beta"))
+    rec = r.get("Rec", "—")
+
+    if m1 is not None: s += max(-15, min(m1, 15)) * 0.8
+    if m3 is not None: s += max(-20, min(m3, 20)) * 0.4
+    if ytd is not None: s += max(-30, min(ytd, 30)) * 0.2
+    if dist is not None:
+        # closer to high = stronger; very far below = bonus only if other factors strong
+        s += max(-30, min(dist, 0)) * 0.15
+    if pe is not None and pe > 0:
+        if pe < 15: s += 6
+        elif pe < 25: s += 2
+        elif pe > 40: s -= 5
+    if dy is not None and dy > 2: s += 3
+    if beta is not None:
+        if beta < 0.8: s += 2
+        elif beta > 1.5: s -= 3
+    if rec in ("strong_buy", "buy"): s += 6
+    elif rec in ("sell", "strong_sell"): s -= 6
+    return round(max(0, min(100, s)), 1)
+
+
+def fmt_num(v, suffix="", dec=2):
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return "N/A"
+    return f"{v:,.{dec}f}{suffix}"
+
+
+def fmt_mcap(v):
+    if v is None: return "N/A"
+    if v >= 1e12: return f"${v/1e12:.2f}T"
+    if v >= 1e9:  return f"${v/1e9:.1f}B"
+    return f"${v/1e6:.0f}M"
+
+
+def fmt_volume(v):
+    if v is None: return "N/A"
+    if v >= 1e9: return f"{v/1e9:.2f}B"
+    if v >= 1e6: return f"{v/1e6:.1f}M"
+    return f"{v/1e3:.0f}K"
+
+
+def page_us_stocks():
+    st.markdown(
+        '<div class="hero">'
+        '<div class="tagline">Module 09</div>'
+        '<h1>U.S. Top Stocks</h1>'
+        '<p class="subtitle">Daily-refreshed Dow Jones 30 dashboard with equity '
+        'research commentary and AI-based ranking.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not HAS_YFINANCE:
+        st.error("This module requires the 'yfinance' library. Install with: pip install yfinance")
+        return
+
+    with st.spinner("Fetching daily Dow 30 data..."):
+        rows = fetch_dow30_data()
+
+    if not rows:
+        st.warning("Unable to fetch live stock data. Please try again shortly.")
+        return
+
+    # Compute scores
+    for r in rows:
+        r["Score"] = score_stock(r)
+
+    df = pd.DataFrame(rows)
+
+    # ── Filters ──
+    section_head("Filters")
+    flt = st.selectbox(
+        "Show",
+        ["All stocks", "Top daily gainers", "Top 5-day performers",
+         "Top 1-month performers", "Undervalued (low P/E)",
+         "High dividend yield", "Low-beta defensive", "Near 52-week high",
+         "Pullback opportunities"],
+    )
+
+    view = df.copy()
+    try:
+        if flt == "Top daily gainers":
+            view = view.sort_values("Daily %", ascending=False).head(10)
+        elif flt == "Top 5-day performers":
+            view = view.sort_values("5D %", ascending=False).head(10)
+        elif flt == "Top 1-month performers":
+            view = view.sort_values("1M %", ascending=False).head(10)
+        elif flt == "Undervalued (low P/E)":
+            view = view[view["P/E"].notna() & (view["P/E"] > 0)].sort_values("P/E").head(10)
+        elif flt == "High dividend yield":
+            view = view[view["Div Yield %"].notna()].sort_values("Div Yield %", ascending=False).head(10)
+        elif flt == "Low-beta defensive":
+            view = view[view["Beta"].notna()].sort_values("Beta").head(10)
+        elif flt == "Near 52-week high":
+            view = view[view["From High %"].notna()].sort_values("From High %", ascending=False).head(10)
+        elif flt == "Pullback opportunities":
+            view = view[view["From High %"].notna()].sort_values("From High %").head(10)
+    except Exception:
+        view = df
+
+    # ── Snapshot summary cards ──
+    section_head("Market Breadth Snapshot")
+    pos = sum(1 for r in rows if (r.get("Daily %") or 0) > 0)
+    neg = sum(1 for r in rows if (r.get("Daily %") or 0) < 0)
+    avg_daily = np.mean([r.get("Daily %") or 0 for r in rows])
+    avg_1m = np.mean([r.get("1M %") for r in rows if r.get("1M %") is not None])
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: data_card("Advancers", f"{pos}/30", "Up today")
+    with c2: data_card("Decliners", f"{neg}/30", "Down today")
+    with c3: data_card("Avg Daily", f"{avg_daily:+.2f}%", "Mean across Dow 30")
+    with c4: data_card("Avg 1M", f"{avg_1m:+.1f}%" if not math.isnan(avg_1m) else "N/A", "Trailing 1 month")
+
+    # ── Main table with conditional formatting ──
+    section_head("Dow 30 Snapshot")
+    display_cols = ["Ticker","Name","Price","Daily %","5D %","1M %","3M %","YTD %",
+                    "From High %","Market Cap","P/E","Div Yield %","Beta","Score"]
+    display_df = view[display_cols].copy()
+
+    def color_returns(v):
+        if pd.isna(v): return "color:#8b96a7"
+        try: v = float(v)
+        except: return ""
+        if v > 0: return "color:#4ade80;font-weight:600"
+        if v < 0: return "color:#f87171;font-weight:600"
+        return "color:#c5d1e3"
+
+    try:
+        styled = (display_df.style
+                  .format({
+                      "Price": "${:,.2f}",
+                      "Daily %": "{:+.2f}%", "5D %": "{:+.1f}%", "1M %": "{:+.1f}%",
+                      "3M %": "{:+.1f}%", "YTD %": "{:+.1f}%", "From High %": "{:+.1f}%",
+                      "Market Cap": lambda x: fmt_mcap(x),
+                      "P/E": "{:.1f}", "Div Yield %": "{:.2f}%", "Beta": "{:.2f}",
+                      "Score": "{:.1f}",
+                  }, na_rep="N/A")
+                  .map(color_returns, subset=["Daily %","5D %","1M %","3M %","YTD %","From High %"])
+                  .set_properties(**{"background-color": "#131c2e", "color": "#c5d1e3"}))
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ── Charts ──
+    section_head("Performance Charts")
+    tab1, tab2, tab3, tab4 = st.tabs(["Daily Returns", "1-Month Returns", "Market Cap", "Risk-Return"])
+
+    with tab1:
+        d = df.dropna(subset=["Daily %"]).sort_values("Daily %", ascending=True)
+        colors = ["#4ade80" if v > 0 else "#f87171" for v in d["Daily %"]]
+        fig = go.Figure(go.Bar(x=d["Daily %"], y=d["Ticker"], orientation="h",
+                               marker_color=colors, text=[f"{v:+.2f}%" for v in d["Daily %"]],
+                               textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
+        layout = base_layout("Daily % Change", height=620)
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        d = df.dropna(subset=["1M %"]).sort_values("1M %", ascending=True)
+        colors = ["#4ade80" if v > 0 else "#f87171" for v in d["1M %"]]
+        fig = go.Figure(go.Bar(x=d["1M %"], y=d["Ticker"], orientation="h",
+                               marker_color=colors, text=[f"{v:+.1f}%" for v in d["1M %"]],
+                               textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
+        layout = base_layout("1-Month % Return", height=620)
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        d = df.dropna(subset=["Market Cap"]).sort_values("Market Cap", ascending=False).head(20)
+        fig = go.Figure(go.Bar(x=d["Ticker"], y=d["Market Cap"], marker_color="#4a90e2",
+                               text=[fmt_mcap(v) for v in d["Market Cap"]],
+                               textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
+        layout = base_layout("Market Capitalization (Top 20)", height=500)
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab4:
+        d = df.dropna(subset=["Beta","1M %"])
+        if not d.empty:
+            fig = go.Figure(go.Scatter(
+                x=d["Beta"], y=d["1M %"], mode="markers+text",
+                text=d["Ticker"], textposition="top center",
+                marker=dict(size=12, color="#c9a96e",
+                            line=dict(color="#FFFFFF", width=1)),
+                textfont=dict(color="#FFFFFF", size=10),
+            ))
+            layout = base_layout("Risk vs Return (Beta vs 1M %)", height=520)
+            layout["xaxis"]["title"] = "Beta"
+            layout["yaxis"]["title"] = "1-Month Return (%)"
+            fig.update_layout(**layout)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Equity Research Commentary ──
+    section_head("Equity Research Summary")
+    best = df.dropna(subset=["Daily %"]).nlargest(3, "Daily %")
+    worst = df.dropna(subset=["Daily %"]).nsmallest(3, "Daily %")
+    mom = df.dropna(subset=["1M %"]).nlargest(3, "1M %")
+    defensive = df.dropna(subset=["Beta"]).nsmallest(3, "Beta")
+    value = df[df["P/E"].notna() & (df["P/E"] > 0)].nsmallest(3, "P/E")
+    income = df.dropna(subset=["Div Yield %"]).nlargest(3, "Div Yield %")
+    near_hi = df.dropna(subset=["From High %"]).nlargest(3, "From High %")
+    pullback = df.dropna(subset=["From High %"]).nsmallest(3, "From High %")
+
+    body = "".join([
+        f"<p><strong>Market breadth:</strong> {pos}/30 advancers vs {neg}/30 decliners. "
+        f"Average daily move {avg_daily:+.2f}%; trailing-month average {avg_1m:+.1f}%. "
+        f"{'Breadth is broadly constructive.' if pos > neg else 'Breadth skews defensive — risk appetite muted.'}</p>",
+        f"<p><strong>Today's leaders:</strong> {', '.join(best['Ticker'].tolist())} led the tape with gains of "
+        f"{best['Daily %'].iloc[0]:+.1f}% to {best['Daily %'].iloc[-1]:+.1f}%.</p>" if not best.empty else "",
+        f"<p><strong>Today's laggards:</strong> {', '.join(worst['Ticker'].tolist())} underperformed, "
+        f"declining {worst['Daily %'].iloc[0]:.1f}% to {worst['Daily %'].iloc[-1]:.1f}%.</p>" if not worst.empty else "",
+        f"<p><strong>Momentum leaders (1M):</strong> {', '.join(mom['Ticker'].tolist())} — "
+        f"strongest trailing-month performance, signaling buying pressure and earnings momentum.</p>" if not mom.empty else "",
+        f"<p><strong>Defensive names (low beta):</strong> {', '.join(defensive['Ticker'].tolist())} — "
+        f"attractive for portfolios prioritizing stability through volatility regimes.</p>" if not defensive.empty else "",
+        f"<p><strong>Value screen (low P/E):</strong> {', '.join(value['Ticker'].tolist())} — "
+        f"trading at the cheapest earnings multiples within the index.</p>" if not value.empty else "",
+        f"<p><strong>Income / dividend leaders:</strong> {', '.join(income['Ticker'].tolist())} — "
+        f"highest dividend yields, suitable for income-oriented allocators.</p>" if not income.empty else "",
+        f"<p><strong>Trading near 52-week highs:</strong> {', '.join(near_hi['Ticker'].tolist())} — "
+        f"strongest relative price action; momentum traders favor breakout setups.</p>" if not near_hi.empty else "",
+        f"<p><strong>Pullback opportunities:</strong> {', '.join(pullback['Ticker'].tolist())} — "
+        f"trading furthest from 52-week highs; potential mean-reversion candidates for value-oriented buyers.</p>" if not pullback.empty else "",
+        "<p><strong>Investment view:</strong> The Dow blend of mega-cap growth (AAPL, MSFT, NVDA, AMZN), "
+        "financials (JPM, GS, AXP, V), industrials (BA, CAT, HON, MMM), healthcare (JNJ, UNH, MRK, AMGN), "
+        "and defensives (KO, PG, WMT, VZ) provides diversified exposure to the U.S. economic cycle.</p>",
+    ])
+    insight_box("Research Commentary", body)
+
+    # ── AI Investment Suggestions ──
+    section_head("AI-Based Investment Suggestions")
+    st.markdown(
+        '<p style="color:#c9a96e;font-weight:600;font-size:0.85rem;letter-spacing:0.5px">'
+        'These suggestions are AI based only.</p>',
+        unsafe_allow_html=True,
+    )
+
+    top5 = df.nlargest(5, "Score")
+    def_picks = df[df["Beta"].notna()].nsmallest(3, "Beta")
+    growth_picks = df[df["Beta"].notna() & df["1M %"].notna()].sort_values(
+        ["1M %","Beta"], ascending=[False, False]).head(3)
+    val_picks = df[df["From High %"].notna() & df["P/E"].notna() & (df["P/E"] > 0)].sort_values(
+        "From High %").head(3)
+
+    def reason_for(r, kind):
+        if kind == "top":
+            return (f"Composite score {r['Score']:.1f}; 1M {fmt_num(r.get('1M %'),'%',1)}, "
+                    f"YTD {fmt_num(r.get('YTD %'),'%',1)}, P/E {fmt_num(r.get('P/E'),'',1)}.")
+        if kind == "def":
+            return f"Low beta of {fmt_num(r.get('Beta'),'',2)} offers downside protection; dividend yield {fmt_num(r.get('Div Yield %'),'%',2)}."
+        if kind == "grow":
+            return f"Strong 1M momentum {fmt_num(r.get('1M %'),'%',1)}; beta {fmt_num(r.get('Beta'),'',2)}."
+        return f"Trading {fmt_num(r.get('From High %'),'%',1)} from 52W high; P/E {fmt_num(r.get('P/E'),'',1)} screens cheap."
+
+    def risk_for(r, kind):
+        if kind == "grow": return "High-beta names amplify drawdowns in risk-off episodes."
+        if kind == "def":  return "Limited upside in strong rally environments."
+        if kind == "val":  return "Value traps possible if structural issues drive the underperformance."
+        return "Concentration risk; monitor index-wide rotations."
+
+    def render_picks(title, picks, kind):
+        st.markdown(f"#### {title}")
+        for _, r in picks.iterrows():
+            st.markdown(
+                f'<div class="data-card">'
+                f'<div class="label">{r["Ticker"]} &nbsp;·&nbsp; {r["Name"]}</div>'
+                f'<div style="color:#FFFFFF;margin-top:0.4rem;font-size:0.9rem;line-height:1.5">'
+                f'<strong style="color:#c9a96e">Reason:</strong> {reason_for(r, kind)}<br/>'
+                f'<strong style="color:#f87171">Key risk:</strong> {risk_for(r, kind)}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    render_picks("Top 5 Stocks to Consider", top5, "top")
+    render_picks("3 Defensive Picks", def_picks, "def")
+    render_picks("3 Higher-Risk Growth / Momentum Picks", growth_picks, "grow")
+    render_picks("3 Value / Pullback Opportunities", val_picks, "val")
+
+    # ── Score table ──
+    section_head("Transparent Scoring Table")
+    score_df = df[["Ticker","Name","Score","1M %","3M %","YTD %","From High %","P/E","Div Yield %","Beta","Rec"]].sort_values("Score", ascending=False)
+    st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+    # Store for memo PDF
+    st.session_state["dow30_data"] = df
+    st.session_state["dow30_top5"] = top5
+    st.session_state["dow30_def"] = def_picks
+    st.session_state["dow30_grow"] = growth_picks
+    st.session_state["dow30_val"] = val_picks
+
+    st.markdown(
+        '<div class="disclaimer">'
+        'This platform is for educational and analytical purposes only and does not '
+        'constitute financial advice.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INVESTMENT COMMITTEE MEMO PDF
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
+                     dow_df=None, top5=None, def_picks=None,
+                     growth_picks=None, val_picks=None):
+    """Generate a polished Investment Committee Memo PDF."""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors as rl
+        from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                         Table, TableStyle, PageBreak)
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+        from reportlab.pdfgen import canvas
+    except ImportError:
+        return None
+
+    buf = io.BytesIO()
+    NAVY = rl.HexColor("#0a2463")
+    GOLD = rl.HexColor("#c9a96e")
+    DARK = rl.HexColor("#2F2F2F")
+    LIGHT = rl.HexColor("#f0f4f8")
+    BORDER = rl.HexColor("#dce4ef")
+
+    def footer(canv, doc):
+        canv.saveState()
+        canv.setFont("Helvetica", 7.5)
+        canv.setFillColor(rl.HexColor("#7a98b5"))
+        canv.drawString(0.75 * inch, 0.4 * inch,
+                        "Global Macro Investment Analyzer  |  Investment Committee Memo")
+        canv.drawRightString(7.75 * inch, 0.4 * inch, f"Page {doc.page}")
+        canv.setStrokeColor(BORDER)
+        canv.line(0.75 * inch, 0.55 * inch, 7.75 * inch, 0.55 * inch)
+        canv.restoreState()
+
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            topMargin=0.75 * inch, bottomMargin=0.8 * inch,
+                            leftMargin=0.75 * inch, rightMargin=0.75 * inch)
+
+    styles = getSampleStyleSheet()
+    title_st = ParagraphStyle("T", parent=styles["Title"], fontSize=24, textColor=NAVY,
+                              alignment=TA_CENTER, spaceAfter=4)
+    sub_st = ParagraphStyle("S", parent=styles["Normal"], fontSize=11,
+                            textColor=rl.HexColor("#5a7a9b"), alignment=TA_CENTER, spaceAfter=18)
+    head_st = ParagraphStyle("H", parent=styles["Heading2"], fontSize=13,
+                             textColor=NAVY, spaceBefore=14, spaceAfter=6)
+    body_st = ParagraphStyle("B", parent=styles["Normal"], fontSize=9.5, leading=14,
+                             textColor=DARK, alignment=TA_JUSTIFY)
+    small_st = ParagraphStyle("Sm", parent=styles["Normal"], fontSize=8,
+                              textColor=rl.HexColor("#7a98b5"), alignment=TA_CENTER)
+
+    def styled_table(data, widths):
+        t = Table(data, colWidths=widths)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), NAVY),
+            ("TEXTCOLOR", (0,0), (-1,0), rl.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,0), 10),
+            ("FONTSIZE", (0,1), (-1,-1), 9),
+            ("ALIGN", (1,0), (-1,-1), "CENTER"),
+            ("ALIGN", (0,0), (0,-1), "LEFT"),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [LIGHT, rl.white]),
+            ("GRID", (0,0), (-1,-1), 0.5, BORDER),
+            ("TOPPADDING", (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ("LINEBELOW", (0,0), (-1,0), 1.5, GOLD),
+        ]))
+        return t
+
+    story = []
+    # ── Title page ──
+    story.append(Spacer(1, 60))
+    story.append(Paragraph("GLOBAL MACRO INVESTMENT ANALYZER", title_st))
+    story.append(Paragraph("Investment Committee Memo", sub_st))
+    story.append(Spacer(1, 30))
+    pair = f"{name_a} vs {name_b}" if name_a and name_b else "U.S. Equity Markets"
+    story.append(Paragraph(f"<b>Subject:</b> {pair}", body_st))
+    story.append(Paragraph(f"<b>Date:</b> {datetime.date.today().strftime('%B %d, %Y')}", body_st))
+    story.append(Paragraph("<b>Prepared by:</b> Vedant Patil", body_st))
+    story.append(PageBreak())
+
+    # ── Executive Summary ──
+    story.append(Paragraph("1. Executive Summary", head_st))
+    es = (f"This memo presents an integrated macro and equity-market view"
+          f"{' across ' + pair if name_a and name_b else ''}. ")
+    if da and db:
+        gw = name_a if (da.get('GDP Growth') or 0) > (db.get('GDP Growth') or 0) else name_b
+        es += f"On the macro front, {gw} screens favorably on growth momentum. "
+    if top5 is not None and not top5.empty:
+        es += f"Within U.S. equities, top-ranked Dow names include {', '.join(top5['Ticker'].head(3).tolist())}. "
+    es += "The recommendation is presented at the end of this memo with supporting rationale and risks."
+    story.append(Paragraph(es, body_st))
+
+    # ── Macro Dashboard ──
+    if da and db:
+        story.append(Paragraph("2. Macro Dashboard Summary", head_st))
+        story.append(styled_table([
+            ["Indicator", name_a or "A", name_b or "B"],
+            ["GDP Growth", fmt_pct_simple(da.get("GDP Growth")), fmt_pct_simple(db.get("GDP Growth"))],
+            ["Inflation", fmt_pct_simple(da.get("Inflation")), fmt_pct_simple(db.get("Inflation"))],
+            ["Lending Rate", fmt_pct_simple(da.get("Lending Rate")), fmt_pct_simple(db.get("Lending Rate"))],
+            ["Unemployment", fmt_pct_simple(da.get("Unemployment")), fmt_pct_simple(db.get("Unemployment"))],
+            ["Govt Debt/GDP", fmt_pct_simple(da.get("Government Debt to GDP")), fmt_pct_simple(db.get("Government Debt to GDP"))],
+            ["Risk Score", f"{risk_adjusted_score(da)}/100", f"{risk_adjusted_score(db)}/100"],
+        ], [2.4*inch, 2.1*inch, 2.1*inch]))
+        story.append(Spacer(1, 10))
+
+    # ── Market & Valuation ──
+    story.append(Paragraph("3. Market & Valuation Summary", head_st))
+    story.append(Paragraph(
+        "Equity returns are driven by earnings growth and multiple changes. Multiples in "
+        "turn reflect interest rates, inflation expectations, and risk appetite. The DCF "
+        "framework links these explicitly: cash flows scale with nominal growth, while the "
+        "discount rate moves with the risk-free rate and equity risk premium.", body_st))
+
+    # ── U.S. Top Stocks ──
+    if dow_df is not None and not dow_df.empty:
+        story.append(Paragraph("4. U.S. Top Stocks Summary (Dow 30)", head_st))
+        if top5 is not None and not top5.empty:
+            tbl = [["Ticker", "Name", "Score", "1M %", "YTD %"]]
+            for _, r in top5.iterrows():
+                tbl.append([r["Ticker"], str(r["Name"])[:25],
+                            f"{r['Score']:.1f}",
+                            fmt_num(r.get("1M %"), "%", 1),
+                            fmt_num(r.get("YTD %"), "%", 1)])
+            story.append(Paragraph("<b>Top 5 Ranked Stocks</b>", body_st))
+            story.append(styled_table(tbl, [0.8*inch, 2.3*inch, 0.8*inch, 1.0*inch, 1.0*inch]))
+            story.append(Spacer(1, 6))
+
+        for label, picks in [("Defensive Picks", def_picks),
+                             ("Growth / Momentum Picks", growth_picks),
+                             ("Value / Pullback Picks", val_picks)]:
+            if picks is not None and not picks.empty:
+                story.append(Paragraph(f"<b>{label}:</b> {', '.join(picks['Ticker'].tolist())}", body_st))
+                story.append(Spacer(1, 3))
+        story.append(Paragraph(
+            "<i>Key risk:</i> Stock-specific drawdowns; sector rotation; macro shocks "
+            "compressing multiples across the index.", body_st))
+
+    # ── Recommendation ──
+    story.append(Paragraph("5. Investment Recommendation", head_st))
+    rec_call = "NEUTRAL"
+    if da and db:
+        sa = risk_adjusted_score(da); sb = risk_adjusted_score(db)
+        if max(sa, sb) > 70: rec_call = "OVERWEIGHT (higher-scoring economy)"
+        elif max(sa, sb) < 45: rec_call = "UNDERWEIGHT"
+    story.append(Paragraph(f"<b>Call:</b> {rec_call}", body_st))
+    story.append(Paragraph(
+        "Rationale: Composite scoring synthesizes growth, inflation, fiscal, and external "
+        "balance signals. Catalysts to monitor include central bank communication, fiscal "
+        "policy shifts, and corporate earnings revisions.", body_st))
+
+    # ── Risk Factors ──
+    story.append(Paragraph("6. Risk Factors", head_st))
+    risks = ("<b>Inflation risk:</b> Persistence forces tighter policy and multiple compression. "
+             "<b>Rate risk:</b> Long-duration assets vulnerable to upside surprises. "
+             "<b>FX risk:</b> Currency moves can dominate equity returns for foreign investors. "
+             "<b>Recession risk:</b> Earnings cuts and credit deterioration. "
+             "<b>Geopolitical risk:</b> Trade, sanctions, conflict episodes. "
+             "<b>Valuation risk:</b> Multiples compressing toward historical averages.")
+    story.append(Paragraph(risks, body_st))
+
+    # ── Appendix ──
+    story.append(Paragraph("7. Appendix", head_st))
+    story.append(Paragraph(
+        "<b>Data sources:</b> World Bank Open Data API, Yahoo Finance (via yfinance). "
+        "<b>Methodology:</b> Composite scoring weighting growth, inflation, fiscal, and "
+        "external metrics; equity screening on momentum, valuation, yield, and beta.",
+        body_st))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        "<b>Disclaimer:</b> This platform is for educational and analytical purposes only "
+        "and does not constitute financial advice, investment recommendation, or solicitation. "
+        "All AI-generated views are illustrative.",
+        small_st))
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def page_ic_memo():
+    st.markdown(
+        '<div class="hero">'
+        '<div class="tagline">Module 10</div>'
+        '<h1>Investment Committee Memo Generator</h1>'
+        '<p class="subtitle">Generate a polished PDF investment memo combining macro, '
+        'market, and equity analysis.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    section_head("Country Pair (optional)")
+    name_a, name_b, code_a, code_b = country_selector(key_suffix="icmemo")
+
+    st.markdown(
+        "<p>The memo will combine the macro view for the selected countries with the "
+        "latest U.S. Top Stocks (Dow 30) analysis. Visit the <strong>U.S. Top Stocks</strong> "
+        "page first to populate the equity section, otherwise that portion will be omitted.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Generate Investment Committee Memo PDF", type="primary"):
+        with st.spinner("Building Investment Committee Memo..."):
+            try:
+                da, db, _, _ = load_pair(code_a, code_b) if name_a != name_b else (None, None, None, None)
+            except Exception:
+                da = db = None
+
+            dow_df = st.session_state.get("dow30_data")
+            top5 = st.session_state.get("dow30_top5")
+            def_picks = st.session_state.get("dow30_def")
+            grow_picks = st.session_state.get("dow30_grow")
+            val_picks = st.session_state.get("dow30_val")
+
+            try:
+                pdf_bytes = build_ic_memo_pdf(
+                    name_a=name_a, name_b=name_b, da=da, db=db,
+                    dow_df=dow_df, top5=top5, def_picks=def_picks,
+                    growth_picks=grow_picks, val_picks=val_picks,
+                )
+                if pdf_bytes:
+                    st.success("Memo generated successfully.")
+                    st.download_button(
+                        "Download Investment Committee Memo",
+                        data=pdf_bytes,
+                        file_name=f"IC_Memo_{datetime.date.today().isoformat()}.pdf",
+                        mime="application/pdf",
+                    )
+                else:
+                    st.error("PDF library not available. Install with: pip install reportlab")
+            except Exception as e:
+                st.error(f"Memo generation failed: {type(e).__name__}")
+
+    st.markdown(
+        '<div class="disclaimer">'
+        'For educational and analytical purposes only — not financial advice.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN ROUTER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2278,6 +2919,8 @@ def main():
         "Sector / Economic Structure",
         "Scenario Analysis",
         "Export / Report Center",
+        "U.S. Top Stocks",
+        "Investment Committee Memo",
     ]
 
     # ── Sidebar branding ──
@@ -2341,6 +2984,10 @@ def main():
         page_scenario()
     elif selected_page == "Export / Report Center":
         page_export()
+    elif selected_page == "U.S. Top Stocks":
+        page_us_stocks()
+    elif selected_page == "Investment Committee Memo":
+        page_ic_memo()
     else:
         page_home()
 
