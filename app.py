@@ -2265,31 +2265,59 @@ def page_export():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PAGE: U.S. TOP STOCKS  (Dow Jones 30 — daily-refreshed)
+#  SHARED STOCK ANALYSIS ENGINE  (used by both U.S. and India pages)
 # ══════════════════════════════════════════════════════════════════════════════
 
 DOW30 = ["AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","GS","HD",
          "HON","IBM","JNJ","JPM","KO","MCD","MMM","MRK","MSFT","NKE","NVDA",
          "PG","SHW","TRV","UNH","V","VZ","WMT","AMZN"]
 
+NIFTY50 = ["RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","BHARTIARTL.NS",
+           "INFY.NS","SBIN.NS","LICI.NS","ITC.NS","HINDUNILVR.NS","LT.NS",
+           "BAJFINANCE.NS","HCLTECH.NS","KOTAKBANK.NS","MARUTI.NS","SUNPHARMA.NS",
+           "AXISBANK.NS","M&M.NS","ULTRACEMCO.NS","TITAN.NS","NTPC.NS","ONGC.NS",
+           "ADANIENT.NS","ADANIPORTS.NS","POWERGRID.NS","BAJAJFINSV.NS",
+           "TATAMOTORS.NS","COALINDIA.NS","ASIANPAINT.NS","WIPRO.NS","BAJAJ-AUTO.NS",
+           "NESTLEIND.NS","TRENT.NS","JSWSTEEL.NS","TATASTEEL.NS","GRASIM.NS",
+           "HINDALCO.NS","TECHM.NS","CIPLA.NS","DRREDDY.NS","BRITANNIA.NS",
+           "EICHERMOT.NS","APOLLOHOSP.NS","SHRIRAMFIN.NS","HEROMOTOCO.NS",
+           "INDUSINDBK.NS","BPCL.NS","TATACONSUM.NS","DIVISLAB.NS","SBILIFE.NS"]
+
+
+def _safe(v, default=None):
+    if v is None: return default
+    try:
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return default
+    except Exception:
+        pass
+    return v
+
+
+def _clean_name(ticker, info):
+    n = info.get("shortName") or info.get("longName")
+    if n: return str(n)
+    return ticker.replace(".NS", "").replace("-", " ").title()
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_dow30_data():
-    """Fetch daily-refreshed Dow 30 stock data. Returns a list of dicts."""
+def fetch_stock_data(tickers, market_name):
+    """Fetch daily-refreshed stock data for any ticker list. Returns list of dicts.
+    Used for both Dow 30 and NIFTY 50."""
     if not HAS_YFINANCE:
-        return []
-    out = []
-    for tk in DOW30:
+        return [], []
+    rows, failed = [], []
+    for tk in tickers:
         try:
             t = yf.Ticker(tk)
-            info = {}
             try:
                 info = t.info or {}
             except Exception:
                 info = {}
             hist = t.history(period="1y")
             if hist is None or hist.empty:
-                continue
+                failed.append(tk); continue
+
             closes = hist["Close"].tolist()
             volumes = hist["Volume"].tolist()
             cur = float(closes[-1])
@@ -2301,7 +2329,6 @@ def fetch_dow30_data():
                 base = closes[-(n+1)]
                 return (cur / base - 1) * 100 if base else None
 
-            # YTD return
             ytd_ret = None
             try:
                 yr = datetime.date.today().year
@@ -2310,16 +2337,24 @@ def fetch_dow30_data():
                     base = float(ytd_rows["Close"].iloc[0])
                     if base: ytd_ret = (cur / base - 1) * 100
             except Exception:
-                ytd_ret = None
+                pass
 
             hi52 = float(max(closes))
             lo52 = float(min(closes))
             dist_hi = (cur / hi52 - 1) * 100 if hi52 else None
             avg_vol = float(np.mean(volumes)) if volumes else None
 
-            row = {
+            # daily-return volatility (annualized) for context
+            try:
+                rets = np.diff(closes) / closes[:-1]
+                vol_ann = float(np.std(rets) * np.sqrt(252) * 100) if len(rets) > 5 else None
+            except Exception:
+                vol_ann = None
+
+            rows.append({
                 "Ticker": tk,
-                "Name": info.get("shortName", tk),
+                "Name": _clean_name(tk, info),
+                "Sector": info.get("sector", "—"),
                 "Price": cur,
                 "Daily %": daily_pct,
                 "5D %": ret_n(5),
@@ -2331,54 +2366,237 @@ def fetch_dow30_data():
                 "From High %": dist_hi,
                 "Volume": float(volumes[-1]) if volumes else None,
                 "Avg Vol": avg_vol,
+                "Volatility %": vol_ann,
                 "Market Cap": info.get("marketCap"),
                 "P/E": info.get("trailingPE"),
                 "Fwd P/E": info.get("forwardPE"),
                 "Div Yield %": (info.get("dividendYield") or 0) * 100 if info.get("dividendYield") else None,
                 "Beta": info.get("beta"),
                 "Rec": info.get("recommendationKey", "—"),
-            }
-            out.append(row)
+            })
         except Exception:
+            failed.append(tk)
             continue
-    return out
+    return rows, failed
 
 
-def _safe(v, default=None):
-    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-        return default
-    return v
+def calculate_stock_score(rows):
+    """Add a composite score 0-100 to each row in place."""
+    for r in rows:
+        s = 50.0
+        m1 = _safe(r.get("1M %"))
+        m3 = _safe(r.get("3M %"))
+        ytd = _safe(r.get("YTD %"))
+        dist = _safe(r.get("From High %"))
+        pe = _safe(r.get("P/E"))
+        dy = _safe(r.get("Div Yield %"))
+        beta = _safe(r.get("Beta"))
+        rec = r.get("Rec", "—")
+        avg_vol = _safe(r.get("Avg Vol"))
+
+        if m1 is not None:  s += max(-15, min(m1, 15)) * 0.8
+        if m3 is not None:  s += max(-20, min(m3, 20)) * 0.4
+        if ytd is not None: s += max(-30, min(ytd, 30)) * 0.2
+        if dist is not None: s += max(-30, min(dist, 0)) * 0.15
+        if pe is not None and pe > 0:
+            if pe < 15: s += 6
+            elif pe < 25: s += 2
+            elif pe > 40: s -= 5
+        if dy is not None and dy > 2: s += 3
+        if beta is not None:
+            if beta < 0.8: s += 2
+            elif beta > 1.5: s -= 3
+        if rec in ("strong_buy", "buy"): s += 6
+        elif rec in ("sell", "strong_sell"): s -= 6
+        if avg_vol is not None and avg_vol > 1e6: s += 1
+        r["Score"] = round(max(0, min(100, s)), 1)
+    return rows
 
 
-def score_stock(r):
-    """Composite ranking score (higher = better)."""
-    s = 50.0
-    m1 = _safe(r.get("1M %"))
-    m3 = _safe(r.get("3M %"))
-    ytd = _safe(r.get("YTD %"))
-    dist = _safe(r.get("From High %"))
-    pe = _safe(r.get("P/E"))
-    dy = _safe(r.get("Div Yield %"))
-    beta = _safe(r.get("Beta"))
-    rec = r.get("Rec", "—")
+def compute_peer_medians(df):
+    """Return median values for use in dynamic reason/risk text."""
+    med = {}
+    for col in ["P/E", "1M %", "3M %", "YTD %", "Beta", "Div Yield %", "From High %",
+                "Volatility %", "Score"]:
+        try:
+            med[col] = float(df[col].dropna().median())
+        except Exception:
+            med[col] = None
+    return med
 
-    if m1 is not None: s += max(-15, min(m1, 15)) * 0.8
-    if m3 is not None: s += max(-20, min(m3, 20)) * 0.4
-    if ytd is not None: s += max(-30, min(ytd, 30)) * 0.2
-    if dist is not None:
-        # closer to high = stronger; very far below = bonus only if other factors strong
-        s += max(-30, min(dist, 0)) * 0.15
-    if pe is not None and pe > 0:
-        if pe < 15: s += 6
-        elif pe < 25: s += 2
-        elif pe > 40: s -= 5
-    if dy is not None and dy > 2: s += 3
-    if beta is not None:
-        if beta < 0.8: s += 2
-        elif beta > 1.5: s -= 3
-    if rec in ("strong_buy", "buy"): s += 6
-    elif rec in ("sell", "strong_sell"): s -= 6
-    return round(max(0, min(100, s)), 1)
+
+def generate_reason(row, category, peer_medians, market_name):
+    """Return a data-specific reason string for a suggested stock."""
+    tk = row["Ticker"]; nm = row["Name"]
+    m1 = _safe(row.get("1M %")); m3 = _safe(row.get("3M %"))
+    ytd = _safe(row.get("YTD %")); dist = _safe(row.get("From High %"))
+    pe = _safe(row.get("P/E")); dy = _safe(row.get("Div Yield %"))
+    beta = _safe(row.get("Beta")); score = row.get("Score", 0)
+    med_pe = peer_medians.get("P/E"); med_score = peer_medians.get("Score") or 50
+
+    if category == "top":
+        bits = [f"composite score of {score:.1f}"]
+        if score and med_score and score > med_score:
+            bits.append(f"above the {market_name} median of {med_score:.1f}")
+        if m1 is not None: bits.append(f"1M return {m1:+.1f}%")
+        if ytd is not None: bits.append(f"YTD {ytd:+.1f}%")
+        if dist is not None and dist > -5:
+            bits.append(f"trading just {abs(dist):.1f}% off the 52-week high — signals institutional accumulation")
+        elif dist is not None:
+            bits.append(f"trading {abs(dist):.1f}% below the 52-week high")
+        if pe is not None and med_pe and pe < med_pe:
+            bits.append(f"P/E of {pe:.1f}x below the peer median of {med_pe:.1f}x")
+        elif pe is not None:
+            bits.append(f"P/E of {pe:.1f}x")
+        return f"{tk} ({nm}) ranks favorably with " + ", ".join(bits) + "."
+
+    if category == "def":
+        bits = []
+        if beta is not None: bits.append(f"beta of {beta:.2f}")
+        if dy is not None and dy > 0: bits.append(f"dividend yield of {dy:.2f}%")
+        if row.get("Volatility %") is not None:
+            bits.append(f"realized volatility of {row['Volatility %']:.1f}%")
+        if m1 is not None and abs(m1) < 5:
+            bits.append(f"steady 1M move of {m1:+.1f}% reflecting limited price drawdown")
+        sec = row.get("Sector", "")
+        if sec and sec != "—":
+            bits.append(f"sector exposure: {sec}")
+        return (f"{tk} ({nm}) offers defensive characteristics — "
+                + ", ".join(bits) + " — suited to risk-off positioning.")
+
+    if category == "grow":
+        bits = []
+        if m1 is not None: bits.append(f"1M momentum of {m1:+.1f}%")
+        if m3 is not None: bits.append(f"3M trend {m3:+.1f}%")
+        if dist is not None: bits.append(f"price {abs(dist):.1f}% from 52W high")
+        if beta is not None: bits.append(f"beta {beta:.2f} amplifies upside in risk-on")
+        return (f"{tk} ({nm}) screens as a momentum / growth candidate with "
+                + ", ".join(bits) + ".")
+
+    # value / pullback
+    bits = []
+    if dist is not None: bits.append(f"trading {abs(dist):.1f}% below 52W high — mean-reversion setup")
+    if pe is not None and med_pe and pe < med_pe:
+        bits.append(f"P/E {pe:.1f}x vs peer median {med_pe:.1f}x")
+    elif pe is not None:
+        bits.append(f"P/E {pe:.1f}x")
+    if dy is not None and dy > 1.5:
+        bits.append(f"dividend yield {dy:.2f}% offers carry while waiting for recovery")
+    if m1 is not None and m1 > 0:
+        bits.append(f"1M return {m1:+.1f}% suggests early stabilization")
+    return f"{tk} ({nm}) flags as a value / pullback opportunity: " + ", ".join(bits) + "."
+
+
+def generate_risk(row, category, peer_medians, market_name):
+    """Return a data-specific risk string for a suggested stock."""
+    pe = _safe(row.get("P/E")); med_pe = peer_medians.get("P/E")
+    beta = _safe(row.get("Beta")); dist = _safe(row.get("From High %"))
+    dy = _safe(row.get("Div Yield %")); m1 = _safe(row.get("1M %"))
+    sec = row.get("Sector", "—")
+
+    if category == "top":
+        if pe is not None and med_pe and pe > med_pe * 1.2:
+            return (f"Valuation risk elevated — P/E of {pe:.1f}x sits {((pe/med_pe)-1)*100:.0f}% above the "
+                    f"peer median, leaving the stock sensitive to earnings misses or rate-driven multiple compression.")
+        if dist is not None and dist > -3:
+            return (f"Trading within {abs(dist):.1f}% of 52W high — limited margin of safety; "
+                    f"sharp reversal possible on macro disappointment or guidance cuts.")
+        if beta is not None and beta > 1.3:
+            return f"Higher beta ({beta:.2f}) means drawdowns will exceed index moves in any risk-off episode."
+        return "Concentrated single-name exposure; consensus crowding can amplify downside on negative surprises."
+
+    if category == "def":
+        if dy is not None and dy < 1:
+            return f"Limited dividend cushion ({dy:.2f}%) — defensive character relies primarily on price stability rather than income."
+        if m1 is not None and m1 < -3:
+            return f"Recent 1M weakness ({m1:+.1f}%) signals defensive label may be tested; monitor for trend deterioration."
+        return ("Opportunity cost — defensive names typically lag in strong rally environments, "
+                "and dividend payouts can be cut under earnings stress.")
+
+    if category == "grow":
+        if beta is not None and beta > 1.4:
+            return (f"Elevated beta of {beta:.2f} implies drawdowns roughly {((beta-1)*100):.0f}% greater than the index "
+                    f"in corrections. Position sizing discipline essential.")
+        if dist is not None and dist > -3:
+            return ("Stock already near 52W high — chase risk is real; entry on a 5-10% pullback offers better risk/reward.")
+        if pe is not None and med_pe and pe > med_pe * 1.3:
+            return f"P/E of {pe:.1f}x leaves zero margin for execution missteps — earnings guidance becomes the swing factor."
+        return "Momentum trades fail abruptly when narrative shifts; use trailing stops and respect technical breaks."
+
+    # value
+    if dist is not None and dist < -25:
+        return (f"Stock trades {abs(dist):.1f}% below 52W high — potential value trap if the drawdown reflects "
+                f"structural deterioration (earnings cuts, sector decline) rather than temporary sentiment.")
+    if m1 is not None and m1 < -5:
+        return f"Continued 1M weakness ({m1:+.1f}%) means catching a falling knife is a real risk — wait for trend confirmation."
+    if pe is not None and pe < 0:
+        return "Negative earnings make P/E meaningless — fundamentals may not support a recovery thesis."
+    return f"Sector headwinds in {sec} can persist longer than expected, delaying mean reversion."
+
+
+def generate_equity_research_summary(df, market_name):
+    """Produce a market-aware research commentary HTML block."""
+    pos = int((df["Daily %"] > 0).sum())
+    neg = int((df["Daily %"] < 0).sum())
+    total = len(df)
+    avg_daily = float(df["Daily %"].mean()) if not df["Daily %"].dropna().empty else 0
+    avg_1m_series = df["1M %"].dropna()
+    avg_1m = float(avg_1m_series.mean()) if not avg_1m_series.empty else None
+
+    best = df.dropna(subset=["Daily %"]).nlargest(3, "Daily %")
+    worst = df.dropna(subset=["Daily %"]).nsmallest(3, "Daily %")
+    mom = df.dropna(subset=["1M %"]).nlargest(3, "1M %")
+    defensive = df.dropna(subset=["Beta"]).nsmallest(3, "Beta")
+    value = df[df["P/E"].notna() & (df["P/E"] > 0)].nsmallest(3, "P/E")
+    income = df.dropna(subset=["Div Yield %"]).nlargest(3, "Div Yield %")
+    near_hi = df.dropna(subset=["From High %"]).nlargest(3, "From High %")
+    pullback = df.dropna(subset=["From High %"]).nsmallest(3, "From High %")
+    high_beta = df.dropna(subset=["Beta"]).nlargest(3, "Beta")
+
+    body = []
+    body.append(f"<p><strong>Market breadth:</strong> {pos}/{total} advancers vs {neg}/{total} decliners. "
+                f"Average daily move {avg_daily:+.2f}%"
+                + (f"; trailing-month average {avg_1m:+.1f}%." if avg_1m is not None else ".")
+                + f" {'Breadth is broadly constructive.' if pos > neg else 'Breadth skews defensive — risk appetite muted.'}</p>")
+    if not best.empty:
+        body.append(f"<p><strong>Today's leaders:</strong> {', '.join(best['Ticker'].tolist())} "
+                    f"led the tape with gains of {best['Daily %'].iloc[0]:+.1f}% to {best['Daily %'].iloc[-1]:+.1f}%.</p>")
+    if not worst.empty:
+        body.append(f"<p><strong>Today's laggards:</strong> {', '.join(worst['Ticker'].tolist())} "
+                    f"underperformed, declining {worst['Daily %'].iloc[0]:.1f}% to {worst['Daily %'].iloc[-1]:.1f}%.</p>")
+    if not mom.empty:
+        body.append(f"<p><strong>Momentum leaders (1M):</strong> {', '.join(mom['Ticker'].tolist())} — "
+                    f"strongest trailing-month performance, signaling buying pressure and earnings momentum.</p>")
+    if not defensive.empty:
+        body.append(f"<p><strong>Defensive names (low beta):</strong> {', '.join(defensive['Ticker'].tolist())} — "
+                    f"attractive for portfolios prioritizing stability through volatility regimes.</p>")
+    if not value.empty:
+        body.append(f"<p><strong>Value screen (low P/E):</strong> {', '.join(value['Ticker'].tolist())} — "
+                    f"trading at the cheapest earnings multiples within the index.</p>")
+    if not income.empty:
+        body.append(f"<p><strong>Income / dividend leaders:</strong> {', '.join(income['Ticker'].tolist())} — "
+                    f"highest dividend yields, suitable for income-oriented allocators.</p>")
+    if not high_beta.empty:
+        body.append(f"<p><strong>Riskier high-beta names:</strong> {', '.join(high_beta['Ticker'].tolist())} — "
+                    f"highest amplification of market moves; suited to risk-on regimes.</p>")
+    if not near_hi.empty:
+        body.append(f"<p><strong>Trading near 52-week highs:</strong> {', '.join(near_hi['Ticker'].tolist())} — "
+                    f"strongest relative price action; breakout setups for momentum traders.</p>")
+    if not pullback.empty:
+        body.append(f"<p><strong>Pullback opportunities:</strong> {', '.join(pullback['Ticker'].tolist())} — "
+                    f"trading furthest from 52-week highs; potential mean-reversion candidates.</p>")
+
+    # Sector-style interpretation
+    if "Sector" in df.columns:
+        sector_counts = df["Sector"].value_counts().head(3)
+        sector_txt = "; ".join([f"{s} ({c})" for s, c in sector_counts.items() if s and s != "—"])
+        if sector_txt:
+            body.append(f"<p><strong>Sector mix:</strong> Largest sector representations in {market_name}: {sector_txt}.</p>")
+
+    body.append(f"<p><strong>{market_name} investment view:</strong> "
+                f"{'Constructive breadth and momentum suggest continued risk appetite.' if pos > neg else 'Defensive positioning warranted while breadth recovers.'}"
+                f" Cross-check single-name selections against sector flows and macro regime.</p>")
+    return "".join(body)
 
 
 def fmt_num(v, suffix="", dec=2):
@@ -2387,11 +2605,11 @@ def fmt_num(v, suffix="", dec=2):
     return f"{v:,.{dec}f}{suffix}"
 
 
-def fmt_mcap(v):
+def fmt_mcap(v, sym="$"):
     if v is None: return "N/A"
-    if v >= 1e12: return f"${v/1e12:.2f}T"
-    if v >= 1e9:  return f"${v/1e9:.1f}B"
-    return f"${v/1e6:.0f}M"
+    if v >= 1e12: return f"{sym}{v/1e12:.2f}T"
+    if v >= 1e9:  return f"{sym}{v/1e9:.1f}B"
+    return f"{sym}{v/1e6:.0f}M"
 
 
 def fmt_volume(v):
@@ -2401,14 +2619,15 @@ def fmt_volume(v):
     return f"{v/1e3:.0f}K"
 
 
-def page_us_stocks():
+def render_top_stocks_page(market_name, tickers, currency_symbol, module_num, session_key):
+    """Render a full top-stocks page for either US or India market."""
     st.markdown(
-        '<div class="hero">'
-        '<div class="tagline">Module 09</div>'
-        '<h1>U.S. Top Stocks</h1>'
-        '<p class="subtitle">Daily-refreshed Dow Jones 30 dashboard with equity '
-        'research commentary and AI-based ranking.</p>'
-        '</div>',
+        f'<div class="hero">'
+        f'<div class="tagline">Module {module_num}</div>'
+        f'<h1>{market_name} Top Stocks</h1>'
+        f'<p class="subtitle">Daily-refreshed dashboard with equity research commentary '
+        f'and data-driven AI ranking.</p>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -2416,18 +2635,18 @@ def page_us_stocks():
         st.error("This module requires the 'yfinance' library. Install with: pip install yfinance")
         return
 
-    with st.spinner("Fetching daily Dow 30 data..."):
-        rows = fetch_dow30_data()
+    with st.spinner(f"Fetching daily {market_name} data..."):
+        rows, failed = fetch_stock_data(tuple(tickers), market_name)
 
     if not rows:
         st.warning("Unable to fetch live stock data. Please try again shortly.")
         return
+    if failed:
+        st.warning(f"Could not fetch data for {len(failed)} ticker(s): {', '.join(failed[:8])}{'...' if len(failed) > 8 else ''}")
 
-    # Compute scores
-    for r in rows:
-        r["Score"] = score_stock(r)
-
+    calculate_stock_score(rows)
     df = pd.DataFrame(rows)
+    peer_medians = compute_peer_medians(df)
 
     # ── Filters ──
     section_head("Filters")
@@ -2437,16 +2656,13 @@ def page_us_stocks():
          "Top 1-month performers", "Undervalued (low P/E)",
          "High dividend yield", "Low-beta defensive", "Near 52-week high",
          "Pullback opportunities"],
+        key=f"flt_{session_key}",
     )
-
     view = df.copy()
     try:
-        if flt == "Top daily gainers":
-            view = view.sort_values("Daily %", ascending=False).head(10)
-        elif flt == "Top 5-day performers":
-            view = view.sort_values("5D %", ascending=False).head(10)
-        elif flt == "Top 1-month performers":
-            view = view.sort_values("1M %", ascending=False).head(10)
+        if flt == "Top daily gainers": view = view.sort_values("Daily %", ascending=False).head(10)
+        elif flt == "Top 5-day performers": view = view.sort_values("5D %", ascending=False).head(10)
+        elif flt == "Top 1-month performers": view = view.sort_values("1M %", ascending=False).head(10)
         elif flt == "Undervalued (low P/E)":
             view = view[view["P/E"].notna() & (view["P/E"] > 0)].sort_values("P/E").head(10)
         elif flt == "High dividend yield":
@@ -2460,23 +2676,24 @@ def page_us_stocks():
     except Exception:
         view = df
 
-    # ── Snapshot summary cards ──
+    # ── Breadth ──
     section_head("Market Breadth Snapshot")
-    pos = sum(1 for r in rows if (r.get("Daily %") or 0) > 0)
-    neg = sum(1 for r in rows if (r.get("Daily %") or 0) < 0)
-    avg_daily = np.mean([r.get("Daily %") or 0 for r in rows])
-    avg_1m = np.mean([r.get("1M %") for r in rows if r.get("1M %") is not None])
+    pos = int((df["Daily %"] > 0).sum())
+    neg = int((df["Daily %"] < 0).sum())
+    avg_daily = float(df["Daily %"].mean())
+    avg_1m_s = df["1M %"].dropna()
+    avg_1m = float(avg_1m_s.mean()) if not avg_1m_s.empty else None
     c1, c2, c3, c4 = st.columns(4)
-    with c1: data_card("Advancers", f"{pos}/30", "Up today")
-    with c2: data_card("Decliners", f"{neg}/30", "Down today")
-    with c3: data_card("Avg Daily", f"{avg_daily:+.2f}%", "Mean across Dow 30")
-    with c4: data_card("Avg 1M", f"{avg_1m:+.1f}%" if not math.isnan(avg_1m) else "N/A", "Trailing 1 month")
+    with c1: data_card("Advancers", f"{pos}/{len(df)}", "Up today")
+    with c2: data_card("Decliners", f"{neg}/{len(df)}", "Down today")
+    with c3: data_card("Avg Daily", f"{avg_daily:+.2f}%", "Mean")
+    with c4: data_card("Avg 1M", f"{avg_1m:+.1f}%" if avg_1m is not None else "N/A", "Trailing 1M")
 
-    # ── Main table with conditional formatting ──
-    section_head("Dow 30 Snapshot")
-    display_cols = ["Ticker","Name","Price","Daily %","5D %","1M %","3M %","YTD %",
-                    "From High %","Market Cap","P/E","Div Yield %","Beta","Score"]
-    display_df = view[display_cols].copy()
+    # ── Table ──
+    section_head(f"{market_name} Snapshot")
+    cols = ["Ticker","Name","Price","Daily %","5D %","1M %","3M %","YTD %",
+            "From High %","Market Cap","P/E","Div Yield %","Beta","Score"]
+    display_df = view[cols].copy()
 
     def color_returns(v):
         if pd.isna(v): return "color:#8b96a7"
@@ -2489,10 +2706,10 @@ def page_us_stocks():
     try:
         styled = (display_df.style
                   .format({
-                      "Price": "${:,.2f}",
+                      "Price": (currency_symbol + "{:,.2f}"),
                       "Daily %": "{:+.2f}%", "5D %": "{:+.1f}%", "1M %": "{:+.1f}%",
                       "3M %": "{:+.1f}%", "YTD %": "{:+.1f}%", "From High %": "{:+.1f}%",
-                      "Market Cap": lambda x: fmt_mcap(x),
+                      "Market Cap": lambda x: fmt_mcap(x, currency_symbol),
                       "P/E": "{:.1f}", "Div Yield %": "{:.2f}%", "Beta": "{:.2f}",
                       "Score": "{:.1f}",
                   }, na_rep="N/A")
@@ -2504,45 +2721,41 @@ def page_us_stocks():
 
     # ── Charts ──
     section_head("Performance Charts")
-    tab1, tab2, tab3, tab4 = st.tabs(["Daily Returns", "1-Month Returns", "Market Cap", "Risk-Return"])
+    tabs = st.tabs(["Daily Returns", "1-Month Returns", "Market Cap", "Risk-Return"])
 
-    with tab1:
+    with tabs[0]:
         d = df.dropna(subset=["Daily %"]).sort_values("Daily %", ascending=True)
         colors = ["#4ade80" if v > 0 else "#f87171" for v in d["Daily %"]]
         fig = go.Figure(go.Bar(x=d["Daily %"], y=d["Ticker"], orientation="h",
                                marker_color=colors, text=[f"{v:+.2f}%" for v in d["Daily %"]],
                                textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
-        layout = base_layout("Daily % Change", height=620)
-        fig.update_layout(**layout)
+        fig.update_layout(**base_layout("Daily % Change", height=max(620, 14*len(d))))
         st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
+    with tabs[1]:
         d = df.dropna(subset=["1M %"]).sort_values("1M %", ascending=True)
         colors = ["#4ade80" if v > 0 else "#f87171" for v in d["1M %"]]
         fig = go.Figure(go.Bar(x=d["1M %"], y=d["Ticker"], orientation="h",
                                marker_color=colors, text=[f"{v:+.1f}%" for v in d["1M %"]],
                                textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
-        layout = base_layout("1-Month % Return", height=620)
-        fig.update_layout(**layout)
+        fig.update_layout(**base_layout("1-Month % Return", height=max(620, 14*len(d))))
         st.plotly_chart(fig, use_container_width=True)
 
-    with tab3:
+    with tabs[2]:
         d = df.dropna(subset=["Market Cap"]).sort_values("Market Cap", ascending=False).head(20)
         fig = go.Figure(go.Bar(x=d["Ticker"], y=d["Market Cap"], marker_color="#4a90e2",
-                               text=[fmt_mcap(v) for v in d["Market Cap"]],
+                               text=[fmt_mcap(v, currency_symbol) for v in d["Market Cap"]],
                                textposition="outside", textfont=dict(color="#FFFFFF", size=10)))
-        layout = base_layout("Market Capitalization (Top 20)", height=500)
-        fig.update_layout(**layout)
+        fig.update_layout(**base_layout("Market Capitalization (Top 20)", height=500))
         st.plotly_chart(fig, use_container_width=True)
 
-    with tab4:
+    with tabs[3]:
         d = df.dropna(subset=["Beta","1M %"])
         if not d.empty:
             fig = go.Figure(go.Scatter(
                 x=d["Beta"], y=d["1M %"], mode="markers+text",
                 text=d["Ticker"], textposition="top center",
-                marker=dict(size=12, color="#c9a96e",
-                            line=dict(color="#FFFFFF", width=1)),
+                marker=dict(size=12, color="#c9a96e", line=dict(color="#FFFFFF", width=1)),
                 textfont=dict(color="#FFFFFF", size=10),
             ))
             layout = base_layout("Risk vs Return (Beta vs 1M %)", height=520)
@@ -2550,46 +2763,15 @@ def page_us_stocks():
             layout["yaxis"]["title"] = "1-Month Return (%)"
             fig.update_layout(**layout)
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("Insufficient beta data for risk-return scatter.")
 
-    # ── Equity Research Commentary ──
+    # ── Research commentary ──
     section_head("Equity Research Summary")
-    best = df.dropna(subset=["Daily %"]).nlargest(3, "Daily %")
-    worst = df.dropna(subset=["Daily %"]).nsmallest(3, "Daily %")
-    mom = df.dropna(subset=["1M %"]).nlargest(3, "1M %")
-    defensive = df.dropna(subset=["Beta"]).nsmallest(3, "Beta")
-    value = df[df["P/E"].notna() & (df["P/E"] > 0)].nsmallest(3, "P/E")
-    income = df.dropna(subset=["Div Yield %"]).nlargest(3, "Div Yield %")
-    near_hi = df.dropna(subset=["From High %"]).nlargest(3, "From High %")
-    pullback = df.dropna(subset=["From High %"]).nsmallest(3, "From High %")
+    insight_box("Research Commentary", generate_equity_research_summary(df, market_name))
 
-    body = "".join([
-        f"<p><strong>Market breadth:</strong> {pos}/30 advancers vs {neg}/30 decliners. "
-        f"Average daily move {avg_daily:+.2f}%; trailing-month average {avg_1m:+.1f}%. "
-        f"{'Breadth is broadly constructive.' if pos > neg else 'Breadth skews defensive — risk appetite muted.'}</p>",
-        f"<p><strong>Today's leaders:</strong> {', '.join(best['Ticker'].tolist())} led the tape with gains of "
-        f"{best['Daily %'].iloc[0]:+.1f}% to {best['Daily %'].iloc[-1]:+.1f}%.</p>" if not best.empty else "",
-        f"<p><strong>Today's laggards:</strong> {', '.join(worst['Ticker'].tolist())} underperformed, "
-        f"declining {worst['Daily %'].iloc[0]:.1f}% to {worst['Daily %'].iloc[-1]:.1f}%.</p>" if not worst.empty else "",
-        f"<p><strong>Momentum leaders (1M):</strong> {', '.join(mom['Ticker'].tolist())} — "
-        f"strongest trailing-month performance, signaling buying pressure and earnings momentum.</p>" if not mom.empty else "",
-        f"<p><strong>Defensive names (low beta):</strong> {', '.join(defensive['Ticker'].tolist())} — "
-        f"attractive for portfolios prioritizing stability through volatility regimes.</p>" if not defensive.empty else "",
-        f"<p><strong>Value screen (low P/E):</strong> {', '.join(value['Ticker'].tolist())} — "
-        f"trading at the cheapest earnings multiples within the index.</p>" if not value.empty else "",
-        f"<p><strong>Income / dividend leaders:</strong> {', '.join(income['Ticker'].tolist())} — "
-        f"highest dividend yields, suitable for income-oriented allocators.</p>" if not income.empty else "",
-        f"<p><strong>Trading near 52-week highs:</strong> {', '.join(near_hi['Ticker'].tolist())} — "
-        f"strongest relative price action; momentum traders favor breakout setups.</p>" if not near_hi.empty else "",
-        f"<p><strong>Pullback opportunities:</strong> {', '.join(pullback['Ticker'].tolist())} — "
-        f"trading furthest from 52-week highs; potential mean-reversion candidates for value-oriented buyers.</p>" if not pullback.empty else "",
-        "<p><strong>Investment view:</strong> The Dow blend of mega-cap growth (AAPL, MSFT, NVDA, AMZN), "
-        "financials (JPM, GS, AXP, V), industrials (BA, CAT, HON, MMM), healthcare (JNJ, UNH, MRK, AMGN), "
-        "and defensives (KO, PG, WMT, VZ) provides diversified exposure to the U.S. economic cycle.</p>",
-    ])
-    insight_box("Research Commentary", body)
-
-    # ── AI Investment Suggestions ──
-    section_head("AI-Based Investment Suggestions")
+    # ── AI suggestions ──
+    section_head(f"AI-Based {market_name} Investment Suggestions")
     st.markdown(
         '<p style="color:#c9a96e;font-weight:600;font-size:0.85rem;letter-spacing:0.5px">'
         'These suggestions are AI based only.</p>',
@@ -2603,51 +2785,55 @@ def page_us_stocks():
     val_picks = df[df["From High %"].notna() & df["P/E"].notna() & (df["P/E"] > 0)].sort_values(
         "From High %").head(3)
 
-    def reason_for(r, kind):
-        if kind == "top":
-            return (f"Composite score {r['Score']:.1f}; 1M {fmt_num(r.get('1M %'),'%',1)}, "
-                    f"YTD {fmt_num(r.get('YTD %'),'%',1)}, P/E {fmt_num(r.get('P/E'),'',1)}.")
-        if kind == "def":
-            return f"Low beta of {fmt_num(r.get('Beta'),'',2)} offers downside protection; dividend yield {fmt_num(r.get('Div Yield %'),'%',2)}."
-        if kind == "grow":
-            return f"Strong 1M momentum {fmt_num(r.get('1M %'),'%',1)}; beta {fmt_num(r.get('Beta'),'',2)}."
-        return f"Trading {fmt_num(r.get('From High %'),'%',1)} from 52W high; P/E {fmt_num(r.get('P/E'),'',1)} screens cheap."
-
-    def risk_for(r, kind):
-        if kind == "grow": return "High-beta names amplify drawdowns in risk-off episodes."
-        if kind == "def":  return "Limited upside in strong rally environments."
-        if kind == "val":  return "Value traps possible if structural issues drive the underperformance."
-        return "Concentration risk; monitor index-wide rotations."
-
     def render_picks(title, picks, kind):
         st.markdown(f"#### {title}")
+        if picks.empty:
+            st.caption("Not enough data for this category."); return
         for _, r in picks.iterrows():
+            reason = generate_reason(r, kind, peer_medians, market_name)
+            risk = generate_risk(r, kind, peer_medians, market_name)
+            # supporting datapoints line
+            dp_bits = []
+            if _safe(r.get("Price")) is not None:
+                dp_bits.append(f"Px {currency_symbol}{r['Price']:,.2f}")
+            if _safe(r.get("1M %")) is not None: dp_bits.append(f"1M {r['1M %']:+.1f}%")
+            if _safe(r.get("YTD %")) is not None: dp_bits.append(f"YTD {r['YTD %']:+.1f}%")
+            if _safe(r.get("From High %")) is not None: dp_bits.append(f"vs 52WH {r['From High %']:+.1f}%")
+            if _safe(r.get("P/E")) is not None: dp_bits.append(f"P/E {r['P/E']:.1f}x")
+            if _safe(r.get("Beta")) is not None: dp_bits.append(f"β {r['Beta']:.2f}")
+            if _safe(r.get("Div Yield %")) is not None: dp_bits.append(f"Yld {r['Div Yield %']:.2f}%")
+            dp_line = "  ·  ".join(dp_bits)
+
             st.markdown(
                 f'<div class="data-card">'
-                f'<div class="label">{r["Ticker"]} &nbsp;·&nbsp; {r["Name"]}</div>'
-                f'<div style="color:#FFFFFF;margin-top:0.4rem;font-size:0.9rem;line-height:1.5">'
-                f'<strong style="color:#c9a96e">Reason:</strong> {reason_for(r, kind)}<br/>'
-                f'<strong style="color:#f87171">Key risk:</strong> {risk_for(r, kind)}'
+                f'<div class="label">{r["Ticker"]} &nbsp;·&nbsp; {r["Name"]} &nbsp;·&nbsp; '
+                f'<span style="color:#c9a96e">{title.split()[1] if len(title.split())>1 else "Pick"}</span></div>'
+                f'<div style="color:#FFFFFF;margin-top:0.4rem;font-size:0.9rem;line-height:1.55">'
+                f'<strong style="color:#c9a96e">Reason:</strong> {reason}<br/>'
+                f'<strong style="color:#f87171">Key risk:</strong> {risk}<br/>'
+                f'<strong style="color:#4a90e2">Data:</strong> <span style="color:#c5d1e3">{dp_line}</span>'
                 f'</div></div>',
                 unsafe_allow_html=True,
             )
 
-    render_picks("Top 5 Stocks to Consider", top5, "top")
+    render_picks(f"Top 5 {market_name} Stocks to Consider", top5, "top")
     render_picks("3 Defensive Picks", def_picks, "def")
     render_picks("3 Higher-Risk Growth / Momentum Picks", growth_picks, "grow")
     render_picks("3 Value / Pullback Opportunities", val_picks, "val")
 
     # ── Score table ──
     section_head("Transparent Scoring Table")
-    score_df = df[["Ticker","Name","Score","1M %","3M %","YTD %","From High %","P/E","Div Yield %","Beta","Rec"]].sort_values("Score", ascending=False)
+    score_df = df[["Ticker","Name","Score","1M %","3M %","YTD %","From High %",
+                   "P/E","Div Yield %","Beta","Rec"]].sort_values("Score", ascending=False)
     st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    # Store for memo PDF
-    st.session_state["dow30_data"] = df
-    st.session_state["dow30_top5"] = top5
-    st.session_state["dow30_def"] = def_picks
-    st.session_state["dow30_grow"] = growth_picks
-    st.session_state["dow30_val"] = val_picks
+    # Persist for memo PDF
+    st.session_state[f"{session_key}_df"] = df
+    st.session_state[f"{session_key}_top5"] = top5
+    st.session_state[f"{session_key}_def"] = def_picks
+    st.session_state[f"{session_key}_grow"] = growth_picks
+    st.session_state[f"{session_key}_val"] = val_picks
+    st.session_state[f"{session_key}_medians"] = peer_medians
 
     st.markdown(
         '<div class="disclaimer">'
@@ -2658,14 +2844,34 @@ def page_us_stocks():
     )
 
 
+def page_us_stocks():
+    render_top_stocks_page(
+        market_name="U.S.",
+        tickers=DOW30,
+        currency_symbol="$",
+        module_num="09",
+        session_key="dow30",
+    )
+
+
+def page_india_stocks():
+    render_top_stocks_page(
+        market_name="India",
+        tickers=NIFTY50,
+        currency_symbol="₹",
+        module_num="10",
+        session_key="nifty50",
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  INVESTMENT COMMITTEE MEMO PDF
+#  INVESTMENT COMMITTEE MEMO PDF  (now covers US + India)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
-                     dow_df=None, top5=None, def_picks=None,
-                     growth_picks=None, val_picks=None):
-    """Generate a polished Investment Committee Memo PDF."""
+                      us_df=None, us_top5=None, us_def=None, us_grow=None, us_val=None,
+                      in_df=None, in_top5=None, in_def=None, in_grow=None, in_val=None):
+    """Generate the polished Investment Committee Memo PDF (US + India aware)."""
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.units import inch
@@ -2673,16 +2879,13 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
         from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                          Table, TableStyle, PageBreak)
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
-        from reportlab.pdfgen import canvas
+        from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
     except ImportError:
         return None
 
     buf = io.BytesIO()
-    NAVY = rl.HexColor("#0a2463")
-    GOLD = rl.HexColor("#c9a96e")
-    DARK = rl.HexColor("#2F2F2F")
-    LIGHT = rl.HexColor("#f0f4f8")
+    NAVY = rl.HexColor("#0a2463"); GOLD = rl.HexColor("#c9a96e")
+    DARK = rl.HexColor("#2F2F2F"); LIGHT = rl.HexColor("#f0f4f8")
     BORDER = rl.HexColor("#dce4ef")
 
     def footer(canv, doc):
@@ -2730,13 +2933,34 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
         ]))
         return t
 
+    def market_block(story, label, df, top5, def_p, grow_p, val_p, ccy="$"):
+        if df is None or df.empty:
+            story.append(Paragraph(f"<i>No {label} data available — visit the {label} Top Stocks page first.</i>", body_st))
+            return
+        story.append(Paragraph(f"<b>{label} — Top 5 Ranked</b>", body_st))
+        if top5 is not None and not top5.empty:
+            tbl = [["Ticker", "Name", "Score", "1M %", "YTD %", "From 52WH"]]
+            for _, r in top5.iterrows():
+                tbl.append([str(r["Ticker"]), str(r["Name"])[:24], f"{r['Score']:.1f}",
+                            fmt_num(r.get("1M %"), "%", 1),
+                            fmt_num(r.get("YTD %"), "%", 1),
+                            fmt_num(r.get("From High %"), "%", 1)])
+            story.append(styled_table(tbl, [0.9*inch, 2.2*inch, 0.7*inch, 0.9*inch, 0.9*inch, 0.95*inch]))
+            story.append(Spacer(1, 4))
+        for sublabel, picks in [("Defensive", def_p), ("Growth / Momentum", grow_p), ("Value / Pullback", val_p)]:
+            if picks is not None and not picks.empty:
+                story.append(Paragraph(f"<b>{label} {sublabel}:</b> " +
+                                       ", ".join(picks["Ticker"].tolist()), body_st))
+                story.append(Spacer(1, 2))
+        story.append(Spacer(1, 6))
+
     story = []
     # ── Title page ──
     story.append(Spacer(1, 60))
     story.append(Paragraph("GLOBAL MACRO INVESTMENT ANALYZER", title_st))
     story.append(Paragraph("Investment Committee Memo", sub_st))
     story.append(Spacer(1, 30))
-    pair = f"{name_a} vs {name_b}" if name_a and name_b else "U.S. Equity Markets"
+    pair = f"{name_a} vs {name_b}" if name_a and name_b and name_a != name_b else "Cross-Market Equity View"
     story.append(Paragraph(f"<b>Subject:</b> {pair}", body_st))
     story.append(Paragraph(f"<b>Date:</b> {datetime.date.today().strftime('%B %d, %Y')}", body_st))
     story.append(Paragraph("<b>Prepared by:</b> Vedant Patil", body_st))
@@ -2744,14 +2968,18 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
 
     # ── Executive Summary ──
     story.append(Paragraph("1. Executive Summary", head_st))
-    es = (f"This memo presents an integrated macro and equity-market view"
-          f"{' across ' + pair if name_a and name_b else ''}. ")
+    es = "This memo presents an integrated macro and equity-market view"
+    if name_a and name_b and name_a != name_b:
+        es += f" across {pair}"
+    es += ". "
     if da and db:
         gw = name_a if (da.get('GDP Growth') or 0) > (db.get('GDP Growth') or 0) else name_b
         es += f"On the macro front, {gw} screens favorably on growth momentum. "
-    if top5 is not None and not top5.empty:
-        es += f"Within U.S. equities, top-ranked Dow names include {', '.join(top5['Ticker'].head(3).tolist())}. "
-    es += "The recommendation is presented at the end of this memo with supporting rationale and risks."
+    us_names = us_top5["Ticker"].head(3).tolist() if us_top5 is not None and not us_top5.empty else []
+    in_names = in_top5["Ticker"].head(3).tolist() if in_top5 is not None and not in_top5.empty else []
+    if us_names: es += f"Top-ranked U.S. names include {', '.join(us_names)}. "
+    if in_names: es += f"Top-ranked India names include {', '.join(in_names)}. "
+    es += "Full recommendations and risks follow."
     story.append(Paragraph(es, body_st))
 
     # ── Macro Dashboard ──
@@ -2771,37 +2999,21 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
     # ── Market & Valuation ──
     story.append(Paragraph("3. Market & Valuation Summary", head_st))
     story.append(Paragraph(
-        "Equity returns are driven by earnings growth and multiple changes. Multiples in "
-        "turn reflect interest rates, inflation expectations, and risk appetite. The DCF "
-        "framework links these explicitly: cash flows scale with nominal growth, while the "
-        "discount rate moves with the risk-free rate and equity risk premium.", body_st))
+        "Equity returns are driven by earnings growth and multiple changes. Multiples reflect "
+        "interest rates, inflation expectations, and risk appetite. The DCF framework links these "
+        "explicitly: cash flows scale with nominal growth, while the discount rate moves with the "
+        "risk-free rate and equity risk premium.", body_st))
 
     # ── U.S. Top Stocks ──
-    if dow_df is not None and not dow_df.empty:
-        story.append(Paragraph("4. U.S. Top Stocks Summary (Dow 30)", head_st))
-        if top5 is not None and not top5.empty:
-            tbl = [["Ticker", "Name", "Score", "1M %", "YTD %"]]
-            for _, r in top5.iterrows():
-                tbl.append([r["Ticker"], str(r["Name"])[:25],
-                            f"{r['Score']:.1f}",
-                            fmt_num(r.get("1M %"), "%", 1),
-                            fmt_num(r.get("YTD %"), "%", 1)])
-            story.append(Paragraph("<b>Top 5 Ranked Stocks</b>", body_st))
-            story.append(styled_table(tbl, [0.8*inch, 2.3*inch, 0.8*inch, 1.0*inch, 1.0*inch]))
-            story.append(Spacer(1, 6))
+    story.append(Paragraph("4. U.S. Top Stocks Summary (Dow 30)", head_st))
+    market_block(story, "U.S.", us_df, us_top5, us_def, us_grow, us_val, "$")
 
-        for label, picks in [("Defensive Picks", def_picks),
-                             ("Growth / Momentum Picks", growth_picks),
-                             ("Value / Pullback Picks", val_picks)]:
-            if picks is not None and not picks.empty:
-                story.append(Paragraph(f"<b>{label}:</b> {', '.join(picks['Ticker'].tolist())}", body_st))
-                story.append(Spacer(1, 3))
-        story.append(Paragraph(
-            "<i>Key risk:</i> Stock-specific drawdowns; sector rotation; macro shocks "
-            "compressing multiples across the index.", body_st))
+    # ── India Top Stocks ──
+    story.append(Paragraph("5. India Top Stocks Summary (NIFTY 50)", head_st))
+    market_block(story, "India", in_df, in_top5, in_def, in_grow, in_val, "₹")
 
     # ── Recommendation ──
-    story.append(Paragraph("5. Investment Recommendation", head_st))
+    story.append(Paragraph("6. Investment Recommendation", head_st))
     rec_call = "NEUTRAL"
     if da and db:
         sa = risk_adjusted_score(da); sb = risk_adjusted_score(db)
@@ -2809,33 +3021,32 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
         elif max(sa, sb) < 45: rec_call = "UNDERWEIGHT"
     story.append(Paragraph(f"<b>Call:</b> {rec_call}", body_st))
     story.append(Paragraph(
-        "Rationale: Composite scoring synthesizes growth, inflation, fiscal, and external "
-        "balance signals. Catalysts to monitor include central bank communication, fiscal "
-        "policy shifts, and corporate earnings revisions.", body_st))
+        "Rationale: Composite scoring synthesizes growth, inflation, fiscal, and external balance "
+        "signals, combined with bottom-up equity screens across U.S. and India markets. Catalysts "
+        "to monitor include central bank communication, fiscal policy shifts, and corporate earnings.",
+        body_st))
 
     # ── Risk Factors ──
-    story.append(Paragraph("6. Risk Factors", head_st))
-    risks = ("<b>Inflation risk:</b> Persistence forces tighter policy and multiple compression. "
-             "<b>Rate risk:</b> Long-duration assets vulnerable to upside surprises. "
-             "<b>FX risk:</b> Currency moves can dominate equity returns for foreign investors. "
-             "<b>Recession risk:</b> Earnings cuts and credit deterioration. "
-             "<b>Geopolitical risk:</b> Trade, sanctions, conflict episodes. "
-             "<b>Valuation risk:</b> Multiples compressing toward historical averages.")
-    story.append(Paragraph(risks, body_st))
+    story.append(Paragraph("7. Risk Factors", head_st))
+    story.append(Paragraph(
+        "<b>Inflation risk:</b> Persistence forces tighter policy and multiple compression. "
+        "<b>Rate risk:</b> Long-duration assets vulnerable to upside surprises. "
+        "<b>FX risk:</b> Currency moves can dominate equity returns for foreign investors. "
+        "<b>Recession risk:</b> Earnings cuts and credit deterioration. "
+        "<b>Geopolitical risk:</b> Trade, sanctions, conflict episodes. "
+        "<b>Valuation risk:</b> Multiples compressing toward historical averages.", body_st))
 
     # ── Appendix ──
-    story.append(Paragraph("7. Appendix", head_st))
+    story.append(Paragraph("8. Appendix", head_st))
     story.append(Paragraph(
         "<b>Data sources:</b> World Bank Open Data API, Yahoo Finance (via yfinance). "
-        "<b>Methodology:</b> Composite scoring weighting growth, inflation, fiscal, and "
-        "external metrics; equity screening on momentum, valuation, yield, and beta.",
-        body_st))
+        "<b>Methodology:</b> Composite scoring weighting growth, inflation, fiscal, and external "
+        "metrics; equity screening on momentum, valuation, yield, and beta.", body_st))
     story.append(Spacer(1, 6))
     story.append(Paragraph(
-        "<b>Disclaimer:</b> This platform is for educational and analytical purposes only "
-        "and does not constitute financial advice, investment recommendation, or solicitation. "
-        "All AI-generated views are illustrative.",
-        small_st))
+        "<b>Disclaimer:</b> This platform is for educational and analytical purposes only and does "
+        "not constitute financial advice, investment recommendation, or solicitation. All AI-generated "
+        "views are illustrative.", small_st))
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     buf.seek(0)
@@ -2845,10 +3056,10 @@ def build_ic_memo_pdf(name_a=None, name_b=None, da=None, db=None,
 def page_ic_memo():
     st.markdown(
         '<div class="hero">'
-        '<div class="tagline">Module 10</div>'
+        '<div class="tagline">Module 11</div>'
         '<h1>Investment Committee Memo Generator</h1>'
         '<p class="subtitle">Generate a polished PDF investment memo combining macro, '
-        'market, and equity analysis.</p>'
+        'U.S. equities, and India equities.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -2857,9 +3068,9 @@ def page_ic_memo():
     name_a, name_b, code_a, code_b = country_selector(key_suffix="icmemo")
 
     st.markdown(
-        "<p>The memo will combine the macro view for the selected countries with the "
-        "latest U.S. Top Stocks (Dow 30) analysis. Visit the <strong>U.S. Top Stocks</strong> "
-        "page first to populate the equity section, otherwise that portion will be omitted.</p>",
+        "<p>The memo combines the macro view with the latest <strong>U.S. Top Stocks</strong> and "
+        "<strong>India Top Stocks</strong> analyses. Visit those pages first to populate the equity "
+        "sections — otherwise they will be omitted gracefully.</p>",
         unsafe_allow_html=True,
     )
 
@@ -2869,18 +3080,19 @@ def page_ic_memo():
                 da, db, _, _ = load_pair(code_a, code_b) if name_a != name_b else (None, None, None, None)
             except Exception:
                 da = db = None
-
-            dow_df = st.session_state.get("dow30_data")
-            top5 = st.session_state.get("dow30_top5")
-            def_picks = st.session_state.get("dow30_def")
-            grow_picks = st.session_state.get("dow30_grow")
-            val_picks = st.session_state.get("dow30_val")
-
             try:
                 pdf_bytes = build_ic_memo_pdf(
                     name_a=name_a, name_b=name_b, da=da, db=db,
-                    dow_df=dow_df, top5=top5, def_picks=def_picks,
-                    growth_picks=grow_picks, val_picks=val_picks,
+                    us_df=st.session_state.get("dow30_df"),
+                    us_top5=st.session_state.get("dow30_top5"),
+                    us_def=st.session_state.get("dow30_def"),
+                    us_grow=st.session_state.get("dow30_grow"),
+                    us_val=st.session_state.get("dow30_val"),
+                    in_df=st.session_state.get("nifty50_df"),
+                    in_top5=st.session_state.get("nifty50_top5"),
+                    in_def=st.session_state.get("nifty50_def"),
+                    in_grow=st.session_state.get("nifty50_grow"),
+                    in_val=st.session_state.get("nifty50_val"),
                 )
                 if pdf_bytes:
                     st.success("Memo generated successfully.")
@@ -2920,6 +3132,7 @@ def main():
         "Scenario Analysis",
         "Export / Report Center",
         "U.S. Top Stocks",
+        "India Top Stocks",
         "Investment Committee Memo",
     ]
 
@@ -2986,6 +3199,8 @@ def main():
         page_export()
     elif selected_page == "U.S. Top Stocks":
         page_us_stocks()
+    elif selected_page == "India Top Stocks":
+        page_india_stocks()
     elif selected_page == "Investment Committee Memo":
         page_ic_memo()
     else:
